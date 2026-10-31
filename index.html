@@ -566,6 +566,7 @@ function riverCard(r) {
   stat.appendChild(el("span", "value", fmt(r.latest_cfs)));
   stat.appendChild(el("span", "unit", "CFS"));
   stat.appendChild(el("span", "delta", deltaText(r.latest_cfs, r.week_ago_cfs, "last week")));
+  if (r.live_time) stat.appendChild(el("span", "delta", "as of " + readingTime(r.live_time)));
   head.appendChild(stat);
   card.appendChild(head);
 
@@ -589,15 +590,102 @@ function riverCard(r) {
   return card;
 }
 
+function renderRivers() {
+  for (let i = charts.length - 1; i >= 0; i--) if (charts[i].river) charts.splice(i, 1);
+  const vg = document.getElementById("rivers");
+  const wasOpen = [...vg.querySelectorAll("details")].map(d => d.open);
+  vg.textContent = "";
+  const first = charts.length;
+  DATA.rivers.forEach(r => vg.appendChild(riverCard(r)));
+  for (let i = first; i < charts.length; i++) { charts[i].river = true; charts[i](); }
+  vg.querySelectorAll("details").forEach((d, i) => { if (wasOpen[i]) d.open = true; });
+}
+
 function renderAll() {
   charts.length = 0;
   const rg = document.getElementById("reservoirs");
   rg.textContent = "";
   DATA.reservoirs.forEach(r => rg.appendChild(reservoirCard(r)));
-  const vg = document.getElementById("rivers");
-  vg.textContent = "";
-  DATA.rivers.forEach(r => vg.appendChild(riverCard(r)));
   charts.forEach(fn => fn());
+  renderRivers();
+}
+
+/* ---------------- live river flows ----------------
+   USGS allows browsers to read its data directly, so every visitor gets current
+   flows without waiting for the 5 AM rebuild. The baked-in 5 AM numbers render
+   first and stay on screen if USGS is slow or down. (Reservoirs can't do this:
+   USBR's server doesn't allow it.) */
+function readingTime(iso) {
+  const t = new Date(iso);
+  if (isNaN(t)) return "";
+  const sameDay = t.toDateString() === new Date().toDateString();
+  return sameDay
+    ? t.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+    : MONTHS[t.getMonth()] + " " + t.getDate();
+}
+
+async function getJSON(url, ms) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ac.signal, cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function pointsBySite(json) {
+  const out = {};
+  for (const ts of (json && json.value && json.value.timeSeries) || []) {
+    const pts = [];
+    for (const p of (ts.values[0] && ts.values[0].value) || []) {
+      const v = parseFloat(p.value);
+      if (isFinite(v) && v > -99999) pts.push([p.dateTime, v]);
+    }
+    out[ts.sourceInfo.siteCode[0].value] = pts;
+  }
+  return out;
+}
+
+let lastLive = 0;
+async function refreshRivers() {
+  lastLive = Date.now();
+  const q = "?format=json&parameterCd=00060&sites=" + DATA.rivers.map(r => r.id).join(",");
+  const base = "https://waterservices.usgs.gov/nwis/";
+  const [dv, iv] = await Promise.allSettled([
+    getJSON(base + "dv/" + q + "&period=P365D", 30000),
+    getJSON(base + "iv/" + q + "&period=PT6H", 30000),
+  ]);
+  const daily = dv.status === "fulfilled" ? pointsBySite(dv.value) : {};
+  const latest = iv.status === "fulfilled" ? pointsBySite(iv.value) : {};
+  let changed = false;
+  for (const r of DATA.rivers) {
+    const d = daily[r.id];
+    if (d && d.length >= 8) {
+      r.dates = d.map(p => p[0].slice(0, 10));
+      r.flows = d.map(p => p[1]);
+      r.year_min = Math.min(...r.flows);
+      r.year_max = Math.max(...r.flows);
+      r.latest_cfs = r.flows[r.flows.length - 1];
+      r.week_ago_cfs = r.flows[r.flows.length - 8];
+      changed = true;
+    }
+    const i = latest[r.id];
+    if (i && i.length) {
+      const [when, cfs] = i[i.length - 1];
+      r.latest_cfs = cfs;
+      r.live_time = when;
+      const wk = new Date(when.slice(0, 10) + "T12:00:00");
+      wk.setDate(wk.getDate() - 7);
+      const wkISO = wk.getFullYear() + "-" + String(wk.getMonth() + 1).padStart(2, "0") + "-" + String(wk.getDate()).padStart(2, "0");
+      const idx = r.dates.indexOf(wkISO);
+      if (idx >= 0) r.week_ago_cfs = r.flows[idx];
+      changed = true;
+    }
+  }
+  if (changed) renderRivers();
 }
 
 /* Freshness stamp. If the page was built before today, say so plainly rather than
@@ -607,7 +695,7 @@ function renderAll() {
   const builtDay = (DATA.built_iso || "").slice(0, 10);
   if (builtDay && builtDay !== todayISO()) {
     stamp.classList.add("stale");
-    stamp.textContent = "⚠ Data is from " + prettyDate(builtDay) + " — reopen this page, or double-click “Refresh Dashboard” in the FlyFishingDashboard folder";
+    stamp.textContent = "⚠ Reservoir and weather data is from " + prettyDate(builtDay);
     // A tab left open overnight won't see the 5 AM rebuild on its own; re-read the
     // file periodically so it heals itself instead of sitting stale.
     setInterval(() => location.reload(), 30 * 60 * 1000);
@@ -616,6 +704,12 @@ function renderAll() {
   }
 })();
 renderAll();
+refreshRivers();
+setInterval(refreshRivers, 15 * 60 * 1000);
+// Phones freeze background tabs, so also catch up when the page comes back into view.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && Date.now() - lastLive > 10 * 60 * 1000) refreshRivers();
+});
 
 let rT;
 addEventListener("resize", () => { clearTimeout(rT); rT = setTimeout(() => charts.forEach(fn => fn()), 150); });
